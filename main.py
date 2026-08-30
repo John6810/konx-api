@@ -463,7 +463,7 @@ async def snipe_intent(ev: dict) -> None:
     while datetime.now(TZ) < deadline and not booked:
         booked = await book(acc, session_id, date)
         if not booked:
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.5)
     await _set_booking_status(event_id, "booked" if booked else "failed")
     log.info("intent %s -> %s", event_id, "✅ booked" if booked else "❌ failed")
 
@@ -574,7 +574,7 @@ async def snipe(rule: AutoRule) -> None:
         while datetime.now(TZ) < deadline and not booked:
             booked = await book(acc, target["session_id"], date)
             if not booked:
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.5)
         if booked:
             await mirror_to_kame(acc, rule.activity, date, target.get("start_time"), target.get("title"))
             log.info("✅ réservé %s %s %s", rule.user, rule.activity, date)
