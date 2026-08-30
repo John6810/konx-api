@@ -228,15 +228,19 @@ def _parse_planning(html: str) -> list[dict]:
         sid = re.search(r"[?&]t=([0-9a-f-]{36})", href)
         if not sid:
             continue
-        text = re.sub(r"<[^>]+>", " ", m.group(0))
+        block = m.group(0)
+        text = re.sub(r"<[^>]+>", " ", block)
         text = re.sub(r"\s+", " ", text).replace("&amp;", "&").strip()
         times = _TIME_RE.findall(text)
         cap = re.search(r"(\d+)\s*/\s*(\d+)", text)
-        title_m = re.search(r"(?:\d{1,2}:\d{2}\s*)+([^\d]+?)\s+\d+\s*place", text)
-        title = (title_m.group(1).strip() if title_m else "").strip(" .|")
+        # Nom du cours : le <h3> de la carte (ex. "Wod", "Hyrox (1h)", "Haltero",
+        # "Functional Body Building"). Fiable, contrairement au texte positionnel.
+        h3 = re.search(r"<h3[^>]*>([\s\S]*?)</h3>", block)
+        title = re.sub(r"<[^>]+>", " ", h3.group(1)) if h3 else ""
+        title = re.sub(r"\s+", " ", title).replace("&amp;", "&").strip()
         out.append({
             "session_id": sid.group(1),
-            "activity": "natation" if "natation" in text.lower() else "crossfit",
+            "activity": "natation" if "natation" in title.lower() else "crossfit",
             "title": title or None,
             "start_time": times[0] if times else None,
             "end_time": times[1] if len(times) > 1 else None,
@@ -266,7 +270,9 @@ async def cancel(acc: Account, booking_id: str, referer_session: str, date: str)
 
 # --- Mirroring vers Kame Hausu ----------------------------------------------
 
-async def mirror_to_kame(acc: Account, activity: str, date: str, time_: str | None) -> None:
+async def mirror_to_kame(
+    acc: Account, activity: str, date: str, time_: str | None, title: str | None = None
+) -> None:
     """Écrit le cours réservé dans le Supabase de Kame Hausu (events / sport)."""
     if not (KAME_SUPABASE_URL and KAME_SERVICE_ROLE_KEY and KAME_HOUSEHOLD_ID):
         return
@@ -274,7 +280,8 @@ async def mirror_to_kame(acc: Account, activity: str, date: str, time_: str | No
     label = "Natation" if activity == "natation" else "CrossFit"
     row = {
         "household_id": KAME_HOUSEHOLD_ID,
-        "title": label,
+        # Nom réel du cours (Wod, Hyrox, Haltero…) s'il est connu, sinon générique.
+        "title": title or label,
         "event_date": date,
         "event_time": time_,
         "assignee": acc.name,
@@ -368,7 +375,7 @@ async def snipe(rule: AutoRule) -> None:
             if not booked:
                 await asyncio.sleep(0.2)
         if booked:
-            await mirror_to_kame(acc, rule.activity, date, target.get("start_time"))
+            await mirror_to_kame(acc, rule.activity, date, target.get("start_time"), target.get("title"))
             log.info("✅ réservé %s %s %s", rule.user, rule.activity, date)
         else:
             log.warning("❌ échec réservation %s %s %s", rule.user, rule.activity, date)
