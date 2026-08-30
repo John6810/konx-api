@@ -251,13 +251,24 @@ def _parse_planning(html: str) -> list[dict]:
     return out
 
 
+async def is_registered(acc: Account, session_id: str, date: str) -> bool:
+    """Vérifie l'inscription réelle : KONX renvoie 200 même trop tôt / en échec,
+    donc on regarde l'état de la séance (« inscrit » / « désinscrire »)."""
+    url = f"{KONX_BASE}/app/seance?t={session_id}&d={date}&club={KONX_CLUB_ID}"
+    r = await client().get(url, headers={"cookie": auth_cookie(acc)})
+    if r.status_code != 200:
+        return False
+    txt = re.sub(r"<[^>]+>", " ", r.text).lower()
+    return ("désinscrire" in txt) or ("annuler ma" in txt) or (" inscrit" in txt)
+
+
 async def book(acc: Account, session_id: str, date: str) -> bool:
-    """Réserve un cours. HTTP 200 = succès (le corps est vide côté KONX)."""
+    """Réserve un cours puis VÉRIFIE l'inscription (un 200 ne suffit pas)."""
     url = f"{KONX_BASE}/app/seance?t={session_id}&d={date}&club={KONX_CLUB_ID}"
     headers = await _action_headers(acc, FALLBACK_BOOK_ACTION, url)
     r = await client().post(url, headers=headers, content=json.dumps([session_id, date, False]))
-    ok = r.status_code == 200 and "error" not in (r.text or "").lower()
-    log.info("book %s %s %s -> %s", acc.key, session_id, date, r.status_code)
+    ok = r.status_code == 200 and await is_registered(acc, session_id, date)
+    log.info("book %s %s %s -> http %s inscrit=%s", acc.key, session_id, date, r.status_code, ok)
     return ok
 
 
@@ -445,7 +456,7 @@ async def snipe_intent(ev: dict) -> None:
     cls = datetime.fromisoformat(f"{date}T{start}:00").replace(tzinfo=TZ)
     opening = cls - timedelta(hours=24)
     now = datetime.now(TZ)
-    wait = (opening - now).total_seconds() - 5
+    wait = (opening - now).total_seconds() - 2
     log.info("intent %s (%s %s %s): ouverture %s (dans %.0f s)", event_id, acc.key, session_id[:8],
              date, opening.isoformat(timespec="minutes"), max(wait, 0))
     if wait > 0:
@@ -458,7 +469,7 @@ async def snipe_intent(ev: dict) -> None:
         return
 
     await ensure_token(acc)
-    deadline = datetime.now(TZ) + timedelta(seconds=8)
+    deadline = datetime.now(TZ) + timedelta(seconds=20)
     booked = False
     while datetime.now(TZ) < deadline and not booked:
         booked = await book(acc, session_id, date)
@@ -546,7 +557,7 @@ async def snipe(rule: AutoRule) -> None:
         now = datetime.now(TZ)
         cls = next_class_dt(rule, now)
         opening = cls - timedelta(hours=rule.lead_hours)
-        wait = (opening - now).total_seconds() - 5      # réveil 5 s avant
+        wait = (opening - now).total_seconds() - 2      # réveil 2 s avant
         log.info("snipe %s %s %s: ouverture %s (dans %.0f s)", rule.user, rule.activity,
                  cls.date(), opening.isoformat(timespec="minutes"), max(wait, 0))
         if wait > 0:
@@ -569,7 +580,7 @@ async def snipe(rule: AutoRule) -> None:
             continue
 
         await ensure_token(acc)            # token chaud
-        deadline = datetime.now(TZ) + timedelta(seconds=8)
+        deadline = datetime.now(TZ) + timedelta(seconds=20)
         booked = False
         while datetime.now(TZ) < deadline and not booked:
             booked = await book(acc, target["session_id"], date)
