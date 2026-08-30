@@ -83,6 +83,7 @@ class Account:
     access_token: str | None = None
     refresh_token: str | None = None
     expires_at: float = 0.0        # epoch s
+    session: dict | None = None    # réponse Supabase complète (= valeur du cookie)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -145,6 +146,9 @@ def _store_session(acc: Account, data: dict) -> None:
     acc.access_token = data["access_token"]
     acc.refresh_token = data.get("refresh_token", acc.refresh_token)
     acc.expires_at = datetime.now(timezone.utc).timestamp() + int(data.get("expires_in", 3600))
+    # On garde la réponse Supabase entière : c'est elle (JSON encodé URL) qui
+    # sert de valeur au cookie sb-...-auth-token attendu par KONX.
+    acc.session = data
 
 
 async def ensure_token(acc: Account, *, margin: float = 120.0) -> str:
@@ -161,16 +165,11 @@ async def ensure_token(acc: Account, *, margin: float = 120.0) -> str:
 def auth_cookie(acc: Account) -> str:
     """
     Cookie de session attendu par le serveur KONX (@supabase/ssr).
-    TODO(live): confirmer le format exact (JSON encodé URL vs préfixe `base64-`,
-    et découpage `.0/.1` si > ~3180 octets). Le HAR observé était du JSON
-    encodé URL, sans préfixe base64 et sur un seul cookie.
+    Format confirmé en conditions réelles : la réponse Supabase COMPLÈTE
+    (access_token, refresh_token, expires_at, user…), en JSON encodé URL, sur
+    un seul cookie. Un objet tronqué est refusé (redirection 307 vers /login).
     """
-    session = {
-        "access_token": acc.access_token,
-        "token_type": "bearer",
-        "refresh_token": acc.refresh_token,
-    }
-    return f"{AUTH_COOKIE}={quote(json.dumps(session, separators=(',', ':')))}"
+    return f"{AUTH_COOKIE}={quote(json.dumps(acc.session, separators=(',', ':')))}"
 
 
 
@@ -213,9 +212,39 @@ async def fetch_planning(acc: Account, date: str) -> list[dict]:
     return _parse_planning(r.text)  # à compléter en conditions réelles
 
 
-def _parse_planning(_html: str) -> list[dict]:
-    # TODO(live): implémenter le parsing RSC (voir HAR / scratchpad planning.html).
-    return []
+_CARD_RE = re.compile(r'<a class="card[^>]*?href="(/app/seance\?[^"]+)"[\s\S]*?</a>')
+_TIME_RE = re.compile(r"(?:[01]?\d|2[0-3]):[0-5]\d")
+
+
+def _parse_planning(html: str) -> list[dict]:
+    """
+    Chaque cours est une carte <a href="/app/seance?t=…&d=…&club=…"> contenant
+    l'heure de début/fin, le nom du cours, la jauge « booked/capacity » et un
+    éventuel cadenas (réservations pas encore ouvertes).
+    """
+    out: list[dict] = []
+    for m in _CARD_RE.finditer(html):
+        href = m.group(1).replace("&amp;", "&")
+        sid = re.search(r"[?&]t=([0-9a-f-]{36})", href)
+        if not sid:
+            continue
+        text = re.sub(r"<[^>]+>", " ", m.group(0))
+        text = re.sub(r"\s+", " ", text).replace("&amp;", "&").strip()
+        times = _TIME_RE.findall(text)
+        cap = re.search(r"(\d+)\s*/\s*(\d+)", text)
+        title_m = re.search(r"(?:\d{1,2}:\d{2}\s*)+([^\d]+?)\s+\d+\s*place", text)
+        title = (title_m.group(1).strip() if title_m else "").strip(" .|")
+        out.append({
+            "session_id": sid.group(1),
+            "activity": "natation" if "natation" in text.lower() else "crossfit",
+            "title": title or None,
+            "start_time": times[0] if times else None,
+            "end_time": times[1] if len(times) > 1 else None,
+            "booked": int(cap.group(1)) if cap else None,
+            "capacity": int(cap.group(2)) if cap else None,
+            "locked": "\U0001f512" in text,   # 🔒 réservations pas encore ouvertes
+        })
+    return out
 
 
 async def book(acc: Account, session_id: str, date: str) -> bool:
