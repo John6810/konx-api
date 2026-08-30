@@ -396,6 +396,114 @@ async def classes_sync_loop() -> None:
         await asyncio.sleep(1800)   # 30 min
 
 
+# --- Réservation depuis l'app (« j'y vais ») ---------------------------------
+#
+# L'app pose un event sport avec konx_session_id + konx_booking_status='pending'.
+# Ici on récupère ces intentions et on réserve pile à l'ouverture (début − 24 h),
+# puis on repasse le statut à 'booked' / 'failed'.
+
+def account_for_person(person: str | None) -> Account | None:
+    if not person:
+        return None
+    p = person.strip().lower()
+    for acc in ACCOUNTS.values():
+        if acc.name.strip().lower() == p or acc.key == p:
+            return acc
+    return None
+
+
+async def _kame_event(event_id: str) -> dict | None:
+    r = await client().get(
+        f"{KAME_SUPABASE_URL}/rest/v1/events",
+        params={"id": f"eq.{event_id}", "select": "id,konx_booking_status"},
+        headers=_kame_headers(),
+    )
+    rows = r.json() if r.status_code < 300 else []
+    return rows[0] if rows else None
+
+
+async def _set_booking_status(event_id: str, status: str) -> None:
+    await client().patch(
+        f"{KAME_SUPABASE_URL}/rest/v1/events",
+        params={"id": f"eq.{event_id}"},
+        headers={**_kame_headers(), "prefer": "return=minimal"},
+        content=json.dumps({"konx_booking_status": status}),
+    )
+
+
+async def snipe_intent(ev: dict) -> None:
+    event_id = ev["id"]
+    acc = account_for_person(ev.get("assignee"))
+    session_id = ev.get("konx_session_id")
+    date = ev.get("event_date")
+    start = (ev.get("event_time") or "00:00")[:5]
+    if not (acc and session_id and date):
+        await _set_booking_status(event_id, "failed")
+        log.warning("intent %s: compte/cours introuvable (assignee=%s)", event_id, ev.get("assignee"))
+        return
+
+    cls = datetime.fromisoformat(f"{date}T{start}:00").replace(tzinfo=TZ)
+    opening = cls - timedelta(hours=24)
+    now = datetime.now(TZ)
+    wait = (opening - now).total_seconds() - 5
+    log.info("intent %s (%s %s %s): ouverture %s (dans %.0f s)", event_id, acc.key, session_id[:8],
+             date, opening.isoformat(timespec="minutes"), max(wait, 0))
+    if wait > 0:
+        await asyncio.sleep(wait)
+
+    # L'utilisateur a pu se désinscrire entre-temps : on revérifie.
+    fresh = await _kame_event(event_id)
+    if not fresh or fresh.get("konx_booking_status") != "pending":
+        log.info("intent %s annulée avant l'ouverture, on n'y touche pas", event_id)
+        return
+
+    await ensure_token(acc)
+    deadline = datetime.now(TZ) + timedelta(seconds=8)
+    booked = False
+    while datetime.now(TZ) < deadline and not booked:
+        booked = await book(acc, session_id, date)
+        if not booked:
+            await asyncio.sleep(0.2)
+    await _set_booking_status(event_id, "booked" if booked else "failed")
+    log.info("intent %s -> %s", event_id, "✅ booked" if booked else "❌ failed")
+
+
+_scheduled_intents: set[str] = set()
+
+
+async def booking_intents_loop() -> None:
+    """Récupère les « j'y vais » en attente et programme leur réservation."""
+    if not (KAME_SUPABASE_URL and KAME_SERVICE_ROLE_KEY):
+        return
+    while True:
+        try:
+            today = datetime.now(TZ).date().isoformat()
+            r = await client().get(
+                f"{KAME_SUPABASE_URL}/rest/v1/events",
+                params={
+                    "select": "id,assignee,konx_session_id,event_date,event_time,konx_booking_status",
+                    "category": "eq.sport",
+                    "konx_booking_status": "eq.pending",
+                    "event_date": f"gte.{today}",
+                },
+                headers=_kame_headers(),
+            )
+            for ev in (r.json() if r.status_code < 300 else []):
+                if ev["id"] not in _scheduled_intents:
+                    _scheduled_intents.add(ev["id"])
+                    asyncio.create_task(_run_intent(ev))
+        except Exception as e:  # noqa: BLE001
+            log.error("booking_intents_loop: %s", e)
+        await asyncio.sleep(60)
+
+
+async def _run_intent(ev: dict) -> None:
+    try:
+        await snipe_intent(ev)
+    finally:
+        _scheduled_intents.discard(ev["id"])
+
+
 # --- Sniper : réserve à l'ouverture (cours − 24 h) ---------------------------
 
 @dataclass
@@ -485,6 +593,7 @@ async def _startup() -> None:
     for rule in rules:
         asyncio.create_task(snipe(rule))
     asyncio.create_task(classes_sync_loop())
+    asyncio.create_task(booking_intents_loop())
     log.info("konx-api démarré · comptes=%s · règles=%d", list(ACCOUNTS), len(rules))
 
 
