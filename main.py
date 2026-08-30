@@ -303,6 +303,99 @@ async def mirror_to_kame(
     )
 
 
+# --- Catalogue « cours de la semaine » (agenda CrossFit) ---------------------
+#
+# Le dimanche, dès que la box publie le planning de la semaine à venir, on le
+# copie dans la table sport_classes de Kame Hausu (l'app l'affiche en lecture ;
+# un cours ne devient un event perso que si l'utilisateur clique « j'y vais »).
+
+def _kame_headers() -> dict:
+    return {
+        "apikey": KAME_SERVICE_ROLE_KEY,
+        "authorization": f"Bearer {KAME_SERVICE_ROLE_KEY}",
+        "content-type": "application/json",
+    }
+
+
+def next_monday(now: datetime) -> str:
+    """Lundi de la semaine À VENIR (le dimanche, c'est demain)."""
+    days = (7 - now.weekday()) % 7 or 7
+    return (now.date() + timedelta(days=days)).isoformat()
+
+
+async def week_published(acc: Account, monday: str) -> bool:
+    """La box a-t-elle publié la semaine ? (≥ 1 cours le lundi visé)"""
+    try:
+        return len(await fetch_planning(acc, monday)) > 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def sync_week_classes(acc: Account, monday: str) -> int:
+    """Copie les 7 jours de la semaine `monday` dans sport_classes (upsert)."""
+    if not (KAME_SUPABASE_URL and KAME_SERVICE_ROLE_KEY and KAME_HOUSEHOLD_ID):
+        raise HTTPException(503, "Supabase Kame Hausu non configuré.")
+    rows: list[dict] = []
+    start = datetime.fromisoformat(monday).date()
+    for i in range(7):
+        day = (start + timedelta(days=i)).isoformat()
+        for c in await fetch_planning(acc, day):
+            rows.append({
+                "household_id": KAME_HOUSEHOLD_ID,
+                "konx_session_id": c["session_id"],
+                "club_id": KONX_CLUB_ID,
+                "class_date": day,
+                "start_time": c.get("start_time"),
+                "end_time": c.get("end_time"),
+                "activity": c.get("activity", "crossfit"),
+                "title": c.get("title"),
+                "capacity": c.get("capacity"),
+                "booked": c.get("booked"),
+                "locked": bool(c.get("locked")),
+                "synced_at": datetime.now(timezone.utc).isoformat(),
+            })
+    if rows:
+        r = await client().post(
+            f"{KAME_SUPABASE_URL}/rest/v1/sport_classes",
+            params={"on_conflict": "household_id,konx_session_id"},
+            headers={**_kame_headers(), "prefer": "resolution=merge-duplicates,return=minimal"},
+            content=json.dumps(rows),
+        )
+        if r.status_code >= 300:
+            raise HTTPException(502, f"upsert sport_classes: {r.status_code} {r.text[:200]}")
+    # Ménage : on retire les cours passés.
+    today = datetime.now(TZ).date().isoformat()
+    await client().request(
+        "DELETE",
+        f"{KAME_SUPABASE_URL}/rest/v1/sport_classes",
+        params={"household_id": f"eq.{KAME_HOUSEHOLD_ID}", "class_date": f"lt.{today}"},
+        headers={**_kame_headers(), "prefer": "return=minimal"},
+    )
+    return len(rows)
+
+
+async def classes_sync_loop() -> None:
+    """Le dimanche, réessaie toutes les 30 min jusqu'à trouver la semaine publiée."""
+    acc = ACCOUNTS.get("john") or (next(iter(ACCOUNTS.values())) if ACCOUNTS else None)
+    if not acc:
+        return
+    synced_for: str | None = None
+    while True:
+        try:
+            now = datetime.now(TZ)
+            target = next_monday(now)
+            if now.weekday() == 6 and synced_for != target:   # dimanche, pas encore fait
+                if await week_published(acc, target):
+                    n = await sync_week_classes(acc, target)
+                    synced_for = target
+                    log.info("📅 cours de la semaine du %s copiés (%d)", target, n)
+                else:
+                    log.info("semaine du %s pas encore publiée, nouvel essai dans 30 min", target)
+        except Exception as e:  # noqa: BLE001
+            log.error("classes_sync_loop: %s", e)
+        await asyncio.sleep(1800)   # 30 min
+
+
 # --- Sniper : réserve à l'ouverture (cours − 24 h) ---------------------------
 
 @dataclass
@@ -391,6 +484,7 @@ async def _startup() -> None:
     rules = load_rules()
     for rule in rules:
         asyncio.create_task(snipe(rule))
+    asyncio.create_task(classes_sync_loop())
     log.info("konx-api démarré · comptes=%s · règles=%d", list(ACCOUNTS), len(rules))
 
 
@@ -409,6 +503,16 @@ async def health() -> dict:
 async def planning(user: str, d: str) -> dict:
     acc = account_or_404(user)
     return {"date": d, "classes": await fetch_planning(acc, d)}
+
+
+@app.post("/sync/classes")
+async def sync_classes_ep(monday: str | None = None) -> dict:
+    """Déclenche un sync manuel du catalogue (par défaut : semaine à venir)."""
+    acc = ACCOUNTS.get("john") or (next(iter(ACCOUNTS.values())) if ACCOUNTS else None)
+    if not acc:
+        raise HTTPException(503, "Aucun compte configuré.")
+    target = monday or next_monday(datetime.now(TZ))
+    return {"week": target, "synced": await sync_week_classes(acc, target)}
 
 
 @app.post("/{user}/book")
