@@ -72,6 +72,7 @@ AUTH_COOKIE = f"sb-{KONX_PROJECT_REF}-auth-token"
 KAME_SUPABASE_URL = env("KAME_SUPABASE_URL")
 KAME_SERVICE_ROLE_KEY = env("KAME_SERVICE_ROLE_KEY")
 KAME_HOUSEHOLD_ID = env("KAME_HOUSEHOLD_ID")
+KAME_APP_URL = env("KAME_APP_URL", "https://kame.jonathan-aerts.dev")
 
 
 @dataclass
@@ -442,6 +443,33 @@ async def _set_booking_status(event_id: str, status: str) -> None:
     )
 
 
+async def notify_booked(person: str | None, title: str, date: str, time_: str | None) -> None:
+    """Prévient la personne que sa séance est réservée (via le Worker Kame Hausu)."""
+    if not (KAME_APP_URL and KAME_SERVICE_ROLE_KEY and KAME_HOUSEHOLD_ID and person):
+        return
+    when = date
+    try:
+        d = datetime.fromisoformat(date).date()
+        when = d.strftime("%d/%m")
+    except Exception:  # noqa: BLE001
+        pass
+    body = f"{title}{(' ' + time_[:5]) if time_ else ''} le {when} — c'est réservé sur KONX 💪"
+    try:
+        await client().post(
+            f"{KAME_APP_URL}/api/push/konx",
+            headers={"authorization": f"Bearer {KAME_SERVICE_ROLE_KEY}", "content-type": "application/json"},
+            content=json.dumps({
+                "householdId": KAME_HOUSEHOLD_ID,
+                "toName": person,
+                "title": "✅ Séance réservée",
+                "body": body,
+                "url": "/sport",
+            }),
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("notify_booked KO: %s", e)
+
+
 async def snipe_intent(ev: dict) -> None:
     event_id = ev["id"]
     acc = account_for_person(ev.get("assignee"))
@@ -477,6 +505,8 @@ async def snipe_intent(ev: dict) -> None:
             await asyncio.sleep(0.5)
     await _set_booking_status(event_id, "booked" if booked else "failed")
     log.info("intent %s -> %s", event_id, "✅ booked" if booked else "❌ failed")
+    if booked:
+        await notify_booked(ev.get("assignee"), ev.get("title") or "Séance", date, ev.get("event_time"))
 
 
 _scheduled_intents: set[str] = set()
@@ -492,7 +522,7 @@ async def booking_intents_loop() -> None:
             r = await client().get(
                 f"{KAME_SUPABASE_URL}/rest/v1/events",
                 params={
-                    "select": "id,assignee,konx_session_id,event_date,event_time,konx_booking_status",
+                    "select": "id,assignee,title,konx_session_id,event_date,event_time,konx_booking_status",
                     "category": "eq.sport",
                     "konx_booking_status": "eq.pending",
                     "event_date": f"gte.{today}",
