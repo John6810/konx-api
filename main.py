@@ -51,11 +51,11 @@ log = logging.getLogger("konx-api")
 TZ = ZoneInfo("Europe/Brussels")
 KONX_BASE = "https://app.konx.be"
 
-# Identifiants des Server Actions relevés dans le HAR. Ils dépendent de la
-# version déployée de KONX : on tente de les re-scraper dynamiquement, avec
-# ces valeurs en repli.
-FALLBACK_BOOK_ACTION = "5a73d5a5fb24933178a6a7ef0b2519e8c087d8a7"
-FALLBACK_CANCEL_ACTION = "2542a4d5c1b41e266c6c2c5f672586615764969e"
+# Identifiants des Server Actions KONX (réserver / annuler). Ils vivent dans le
+# bundle JS de KONX et sont stables tant que KONX ne rebuild pas. On les rend
+# surchargeable par secret (KONX_BOOK_ACTION / KONX_CANCEL_ACTION) pour pouvoir
+# corriger sans redéployer, et un auto-contrôle au démarrage alerte s'ils ont
+# disparu du bundle (= KONX a changé de version).
 
 
 def env(name: str, default: str | None = None) -> str | None:
@@ -66,6 +66,8 @@ def env(name: str, default: str | None = None) -> str | None:
 KONX_SUPABASE_URL = env("KONX_SUPABASE_URL", "https://pyravfqvstegswptwraq.supabase.co")
 KONX_ANON_KEY = env("KONX_ANON_KEY")
 KONX_CLUB_ID = env("KONX_CLUB_ID", "a7ff5791-6ab7-447b-97d1-038d767693b0")
+FALLBACK_BOOK_ACTION = env("KONX_BOOK_ACTION", "5a73d5a5fb24933178a6a7ef0b2519e8c087d8a7")
+FALLBACK_CANCEL_ACTION = env("KONX_CANCEL_ACTION", "2542a4d5c1b41e266c6c2c5f672586615764969e")
 KONX_PROJECT_REF = KONX_SUPABASE_URL.split("//", 1)[-1].split(".", 1)[0]
 AUTH_COOKIE = f"sb-{KONX_PROJECT_REF}-auth-token"
 
@@ -273,11 +275,28 @@ async def book(acc: Account, session_id: str, date: str) -> bool:
     return ok
 
 
-async def cancel(acc: Account, booking_id: str, referer_session: str, date: str) -> bool:
-    url = f"{KONX_BASE}/app/seance?t={referer_session}&d={date}&club={KONX_CLUB_ID}"
+async def cancel(acc: Account, t: str, date: str) -> bool:
+    """
+    Annule la réservation du cours `t`. KONX attend l'id INTERNE de la séance
+    (champ `session_id` de la page, différent de l'id public `t=`), pas un id
+    de réservation. On le lit sur la page, puis on POST l'action d'annulation.
+    """
+    url = f"{KONX_BASE}/app/seance?t={t}&d={date}&club={KONX_CLUB_ID}"
+    await ensure_token(acc)
+    page = (await client().get(url, headers={"cookie": auth_cookie(acc)})).text
+    if "ésinscri" not in page.lower():
+        return True  # déjà pas inscrit → rien à annuler
+    i = page.find("session_id")
+    m = re.search(r"[0-9a-f-]{36}", page[i : i + 60]) if i >= 0 else None
+    if not m:
+        log.warning("cancel %s %s : session_id interne introuvable", acc.key, t)
+        return False
     headers = await _action_headers(acc, FALLBACK_CANCEL_ACTION, url)
-    r = await client().post(url, headers=headers, content=json.dumps([booking_id]))
-    return r.status_code == 200
+    r = await client().post(url, headers=headers, content=json.dumps([m.group(0)]))
+    if r.status_code != 200:
+        return False
+    after = (await client().get(url, headers={"cookie": auth_cookie(acc)})).text
+    return "ésinscri" not in after.lower()
 
 
 # --- Mirroring vers Kame Hausu ----------------------------------------------
@@ -533,9 +552,49 @@ async def booking_intents_loop() -> None:
                 if ev["id"] not in _scheduled_intents:
                     _scheduled_intents.add(ev["id"])
                     asyncio.create_task(_run_intent(ev))
+
+            # Demandes d'annulation (« se retirer » dans l'app) : on annule sur
+            # KONX puis on retire l'event pour qu'il disparaisse de l'app.
+            rc = await client().get(
+                f"{KAME_SUPABASE_URL}/rest/v1/events",
+                params={
+                    "select": "id,assignee,konx_session_id,event_date",
+                    "category": "eq.sport",
+                    "konx_booking_status": "eq.cancel",
+                },
+                headers=_kame_headers(),
+            )
+            for ev in (rc.json() if rc.status_code < 300 else []):
+                await _process_cancel(ev)
         except Exception as e:  # noqa: BLE001
             log.error("booking_intents_loop: %s", e)
         await asyncio.sleep(60)
+
+
+async def _kame_delete_event(event_id: str) -> None:
+    await client().request(
+        "DELETE",
+        f"{KAME_SUPABASE_URL}/rest/v1/events",
+        params={"id": f"eq.{event_id}"},
+        headers={**_kame_headers(), "prefer": "return=minimal"},
+    )
+
+
+async def _process_cancel(ev: dict) -> None:
+    acc = account_for_person(ev.get("assignee"))
+    t = ev.get("konx_session_id")
+    date = ev.get("event_date")
+    if not (acc and t and date):
+        # Rien à annuler côté KONX (compte/cours inconnu) : on retire quand même.
+        await _kame_delete_event(ev["id"])
+        return
+    try:
+        ok = await cancel(acc, t, date)
+        log.info("annulation %s %s %s -> %s", acc.key, t[:8], date, "✅" if ok else "❌")
+    except Exception as e:  # noqa: BLE001
+        log.error("_process_cancel %s: %s", ev["id"], e)
+        return  # on réessaiera au prochain passage (event garde le statut 'cancel')
+    await _kame_delete_event(ev["id"])
 
 
 async def _run_intent(ev: dict) -> None:
@@ -626,6 +685,24 @@ async def snipe(rule: AutoRule) -> None:
 
 # --- Cycle de vie & endpoints ------------------------------------------------
 
+async def verify_actions() -> None:
+    """Alerte si les ids d'action ne sont plus dans le bundle KONX (rebuild)."""
+    try:
+        page = (await client().get(f"{KONX_BASE}/app/seance")).text
+        m = re.search(r"/_next/static/chunks/app/app/seance/[\w.-]+\.js", page)
+        if not m:
+            return
+        js = (await client().get(f"{KONX_BASE}{m.group(0)}")).text
+        for name, aid in (("réserver", FALLBACK_BOOK_ACTION), ("annuler", FALLBACK_CANCEL_ACTION)):
+            if aid not in js:
+                log.error("⚠️ action « %s » (%s) absente du bundle KONX — id à mettre à jour (KONX_%s_ACTION)",
+                          name, aid[:12], "BOOK" if name == "réserver" else "CANCEL")
+            else:
+                log.info("action « %s » ok (%s)", name, aid[:12])
+    except Exception as e:  # noqa: BLE001
+        log.warning("verify_actions: %s", e)
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     global _client
@@ -635,6 +712,7 @@ async def _startup() -> None:
         asyncio.create_task(snipe(rule))
     asyncio.create_task(classes_sync_loop())
     asyncio.create_task(booking_intents_loop())
+    asyncio.create_task(verify_actions())
     log.info("konx-api démarré · comptes=%s · règles=%d", list(ACCOUNTS), len(rules))
 
 
@@ -672,6 +750,6 @@ async def book_ep(user: str, session_id: str, date: str) -> dict:
 
 
 @app.delete("/{user}/book")
-async def cancel_ep(user: str, booking_id: str, session_id: str, date: str) -> dict:
+async def cancel_ep(user: str, session_id: str, date: str) -> dict:
     acc = account_or_404(user)
-    return {"cancelled": await cancel(acc, booking_id, session_id, date)}
+    return {"cancelled": await cancel(acc, session_id, date)}
