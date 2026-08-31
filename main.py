@@ -265,14 +265,55 @@ async def is_registered(acc: Account, session_id: str, date: str) -> bool:
     return ("désinscrire" in txt) or ("annuler ma" in txt) or (" inscrit" in txt)
 
 
-async def book(acc: Account, session_id: str, date: str) -> bool:
-    """Réserve un cours puis VÉRIFIE l'inscription (un 200 ne suffit pas)."""
+# Id d'action « réserver » courant : part de la valeur connue, mais peut être
+# ré-appris automatiquement si KONX a rebuild (voir auto_repair_book).
+_book_action = FALLBACK_BOOK_ACTION
+_cancel_action = FALLBACK_CANCEL_ACTION
+
+
+async def scrape_action_ids() -> list[str]:
+    """Tous les ids de Server Actions du bundle de la route /app/seance."""
+    try:
+        page = (await client().get(f"{KONX_BASE}/app/seance")).text
+        m = re.search(r"/_next/static/chunks/app/app/seance/[\w.-]+\.js", page)
+        if not m:
+            return []
+        js = (await client().get(f"{KONX_BASE}{m.group(0)}")).text
+        # (0,n.$)("<hash>") = createServerReference
+        return list(dict.fromkeys(re.findall(r'\$\)\("([0-9a-f]{40})"\)', js)))
+    except Exception as e:  # noqa: BLE001
+        log.warning("scrape_action_ids: %s", e)
+        return []
+
+
+async def _post_book(acc: Account, session_id: str, date: str, action_id: str) -> bool:
     url = f"{KONX_BASE}/app/seance?t={session_id}&d={date}&club={KONX_CLUB_ID}"
-    headers = await _action_headers(acc, FALLBACK_BOOK_ACTION, url)
+    headers = await _action_headers(acc, action_id, url)
     r = await client().post(url, headers=headers, content=json.dumps([session_id, date, False]))
-    ok = r.status_code == 200 and await is_registered(acc, session_id, date)
-    log.info("book %s %s %s -> http %s inscrit=%s", acc.key, session_id, date, r.status_code, ok)
+    return r.status_code == 200 and await is_registered(acc, session_id, date)
+
+
+async def book(acc: Account, session_id: str, date: str) -> bool:
+    """Réserve avec l'id connu et VÉRIFIE l'inscription (un 200 ne suffit pas)."""
+    ok = await _post_book(acc, session_id, date, _book_action)
+    log.info("book %s %s %s -> inscrit=%s", acc.key, session_id, date, ok)
     return ok
+
+
+async def auto_repair_book(acc: Account, session_id: str, date: str) -> bool:
+    """
+    Si l'id connu ne réserve plus (rebuild KONX), on essaie les autres ids du
+    bundle en vérifiant l'inscription à chaque fois — un mauvais id ne peut donc
+    pas « faussement réussir ». Le premier qui inscrit devient le nouvel id.
+    """
+    global _book_action
+    candidates = [a for a in await scrape_action_ids() if a != _book_action]
+    for aid in candidates:
+        if await _post_book(acc, session_id, date, aid):
+            log.warning("auto-repair: nouvel id de réservation %s (ancien %s)", aid[:12], _book_action[:12])
+            _book_action = aid
+            return True
+    return False
 
 
 async def cancel(acc: Account, t: str, date: str) -> bool:
@@ -291,12 +332,26 @@ async def cancel(acc: Account, t: str, date: str) -> bool:
     if not m:
         log.warning("cancel %s %s : session_id interne introuvable", acc.key, t)
         return False
-    headers = await _action_headers(acc, FALLBACK_CANCEL_ACTION, url)
-    r = await client().post(url, headers=headers, content=json.dumps([m.group(0)]))
-    if r.status_code != 200:
-        return False
-    after = (await client().get(url, headers={"cookie": auth_cookie(acc)})).text
-    return "ésinscri" not in after.lower()
+    internal = m.group(0)
+
+    async def try_cancel(action_id: str) -> bool:
+        headers = await _action_headers(acc, action_id, url)
+        r = await client().post(url, headers=headers, content=json.dumps([internal]))
+        if r.status_code != 200:
+            return False
+        after = (await client().get(url, headers={"cookie": auth_cookie(acc)})).text
+        return "ésinscri" not in after.lower()
+
+    global _cancel_action
+    if await try_cancel(_cancel_action):
+        return True
+    # Id d'annulation périmé (rebuild KONX) : on ré-apprend, avec vérification.
+    for aid in (a for a in await scrape_action_ids() if a != _cancel_action):
+        if await try_cancel(aid):
+            log.warning("auto-repair: nouvel id d'annulation %s (ancien %s)", aid[:12], _cancel_action[:12])
+            _cancel_action = aid
+            return True
+    return False
 
 
 # --- Mirroring vers Kame Hausu ----------------------------------------------
@@ -489,6 +544,32 @@ async def notify_booked(person: str | None, title: str, date: str, time_: str | 
         log.warning("notify_booked KO: %s", e)
 
 
+async def notify_failed(person: str | None, title: str, date: str, time_: str | None) -> None:
+    """Prévient la personne qu'une réservation a échoué (à faire à la main)."""
+    if not (KAME_APP_URL and KAME_SERVICE_ROLE_KEY and KAME_HOUSEHOLD_ID and person):
+        return
+    when = date
+    try:
+        when = datetime.fromisoformat(date).date().strftime("%d/%m")
+    except Exception:  # noqa: BLE001
+        pass
+    body = f"{title}{(' ' + time_[:5]) if time_ else ''} le {when} : impossible de réserver — réserve à la main sur KONX."
+    try:
+        await client().post(
+            f"{KAME_APP_URL}/api/push/konx",
+            headers={"authorization": f"Bearer {KAME_SERVICE_ROLE_KEY}", "content-type": "application/json"},
+            content=json.dumps({
+                "householdId": KAME_HOUSEHOLD_ID,
+                "toName": person,
+                "title": "⚠️ Réservation ratée",
+                "body": body,
+                "url": "/sport/cours",
+            }),
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("notify_failed KO: %s", e)
+
+
 async def snipe_intent(ev: dict) -> None:
     event_id = ev["id"]
     acc = account_for_person(ev.get("assignee"))
@@ -522,10 +603,17 @@ async def snipe_intent(ev: dict) -> None:
         booked = await book(acc, session_id, date)
         if not booked:
             await asyncio.sleep(0.5)
+    # Échec avec l'id connu : peut-être un rebuild KONX → on ré-apprend l'id.
+    if not booked:
+        booked = await auto_repair_book(acc, session_id, date)
+
     await _set_booking_status(event_id, "booked" if booked else "failed")
     log.info("intent %s -> %s", event_id, "✅ booked" if booked else "❌ failed")
+    title = ev.get("title") or "Séance"
     if booked:
-        await notify_booked(ev.get("assignee"), ev.get("title") or "Séance", date, ev.get("event_time"))
+        await notify_booked(ev.get("assignee"), title, date, ev.get("event_time"))
+    else:
+        await notify_failed(ev.get("assignee"), title, date, ev.get("event_time"))
 
 
 _scheduled_intents: set[str] = set()
@@ -675,11 +763,14 @@ async def snipe(rule: AutoRule) -> None:
             booked = await book(acc, target["session_id"], date)
             if not booked:
                 await asyncio.sleep(0.5)
+        if not booked:
+            booked = await auto_repair_book(acc, target["session_id"], date)
         if booked:
             await mirror_to_kame(acc, rule.activity, date, target.get("start_time"), target.get("title"))
             log.info("✅ réservé %s %s %s", rule.user, rule.activity, date)
         else:
             log.warning("❌ échec réservation %s %s %s", rule.user, rule.activity, date)
+            await notify_failed(acc.name, target.get("title") or rule.activity, date, target.get("start_time"))
         await asyncio.sleep(60)            # évite un re-tir immédiat
 
 
