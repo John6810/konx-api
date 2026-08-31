@@ -118,7 +118,8 @@ def client() -> httpx.AsyncClient:
 # --- Auth Supabase -----------------------------------------------------------
 
 async def _login(acc: Account) -> None:
-    """grant_type=password → access/refresh tokens."""
+    """grant_type=password → nouvelle session (éjecte la session du tél si KONX
+    est en single-session). On l'évite au maximum grâce au refresh persistant."""
     r = await client().post(
         f"{KONX_SUPABASE_URL}/auth/v1/token",
         params={"grant_type": "password"},
@@ -128,10 +129,15 @@ async def _login(acc: Account) -> None:
     if r.status_code != 200:
         raise HTTPException(502, f"KONX login {acc.key}: {r.status_code} {r.text[:200]}")
     _store_session(acc, r.json())
-    log.info("login ok: %s", acc.key)
+    await _persist_session(acc)
+    log.info("login (mot de passe) ok: %s", acc.key)
 
 
-async def _refresh(acc: Account) -> None:
+async def _try_refresh(acc: Account) -> bool:
+    """Rafraîchit le jeton SANS créer de nouvelle session (ne déconnecte pas le
+    tél). Renvoie False si le refresh token n'est plus valide."""
+    if not acc.refresh_token:
+        return False
     r = await client().post(
         f"{KONX_SUPABASE_URL}/auth/v1/token",
         params={"grant_type": "refresh_token"},
@@ -139,10 +145,10 @@ async def _refresh(acc: Account) -> None:
         json={"refresh_token": acc.refresh_token},
     )
     if r.status_code != 200:
-        # refresh périmé → relogin complet
-        await _login(acc)
-        return
+        return False
     _store_session(acc, r.json())
+    await _persist_session(acc)
+    return True
 
 
 def _store_session(acc: Account, data: dict) -> None:
@@ -154,14 +160,67 @@ def _store_session(acc: Account, data: dict) -> None:
     acc.session = data
 
 
+async def _persist_session(acc: Account) -> None:
+    """Sauve la session dans Kame Hausu (illisible côté client) pour survivre
+    à un redémarrage du pod sans reconnexion au mot de passe."""
+    if not (KAME_SUPABASE_URL and KAME_SERVICE_ROLE_KEY and acc.session):
+        return
+    try:
+        await client().post(
+            f"{KAME_SUPABASE_URL}/rest/v1/konx_sessions",
+            params={"on_conflict": "account_key"},
+            headers={**_kame_headers(), "prefer": "resolution=merge-duplicates,return=minimal"},
+            content=json.dumps({
+                "account_key": acc.key,
+                "session": acc.session,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }),
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("persist_session %s: %s", acc.key, e)
+
+
+async def _load_saved_session(acc: Account) -> bool:
+    """Recharge la session sauvée (refresh token) au démarrage. Renvoie False
+    si rien de sauvé."""
+    if not (KAME_SUPABASE_URL and KAME_SERVICE_ROLE_KEY):
+        return False
+    try:
+        r = await client().get(
+            f"{KAME_SUPABASE_URL}/rest/v1/konx_sessions",
+            params={"account_key": f"eq.{acc.key}", "select": "session"},
+            headers=_kame_headers(),
+        )
+        rows = r.json() if r.status_code < 300 else []
+        if not rows:
+            return False
+        data = rows[0]["session"]
+        acc.session = data
+        acc.access_token = data.get("access_token")
+        acc.refresh_token = data.get("refresh_token")
+        acc.expires_at = 0.0  # force un refresh immédiat (le token stocké peut être périmé)
+        return bool(acc.refresh_token)
+    except Exception as e:  # noqa: BLE001
+        log.warning("load_session %s: %s", acc.key, e)
+        return False
+
+
 async def ensure_token(acc: Account, *, margin: float = 120.0) -> str:
-    """Renvoie un access_token valide (login/refresh au besoin), thread-safe."""
+    """
+    Renvoie un access_token valide. Ordre de préférence pour NE PAS déconnecter
+    le tél : jeton en mémoire → refresh (session persistée) → login mot de passe.
+    """
     async with acc.lock:
         now = datetime.now(timezone.utc).timestamp()
-        if not acc.access_token:
-            await _login(acc)
-        elif acc.expires_at - now < margin:
-            await _refresh(acc)
+        if acc.access_token and acc.expires_at - now >= margin:
+            return acc.access_token
+        # 1) refresh en mémoire ; 2) refresh via session sauvée ; 3) login mdp.
+        if await _try_refresh(acc):
+            return acc.access_token  # type: ignore[return-value]
+        if not acc.access_token and await _load_saved_session(acc) and await _try_refresh(acc):
+            log.info("session restaurée (refresh) : %s — pas de reconnexion mot de passe", acc.key)
+            return acc.access_token  # type: ignore[return-value]
+        await _login(acc)
         return acc.access_token  # type: ignore[return-value]
 
 
