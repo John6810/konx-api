@@ -271,10 +271,16 @@ _book_action = FALLBACK_BOOK_ACTION
 _cancel_action = FALLBACK_CANCEL_ACTION
 
 
-async def scrape_action_ids() -> list[str]:
-    """Tous les ids de Server Actions du bundle de la route /app/seance."""
+async def scrape_action_ids(acc: Account, t: str, date: str) -> list[str]:
+    """
+    Ids des Server Actions du bundle de la route /app/seance. On récupère l'URL
+    du chunk sur une page séance AUTHENTIFIÉE (sinon KONX redirige vers /login),
+    puis on lit le chunk (asset public).
+    """
     try:
-        page = (await client().get(f"{KONX_BASE}/app/seance")).text
+        url = f"{KONX_BASE}/app/seance?t={t}&d={date}&club={KONX_CLUB_ID}"
+        await ensure_token(acc)
+        page = (await client().get(url, headers={"cookie": auth_cookie(acc)})).text
         m = re.search(r"/_next/static/chunks/app/app/seance/[\w.-]+\.js", page)
         if not m:
             return []
@@ -307,7 +313,7 @@ async def auto_repair_book(acc: Account, session_id: str, date: str) -> bool:
     pas « faussement réussir ». Le premier qui inscrit devient le nouvel id.
     """
     global _book_action
-    candidates = [a for a in await scrape_action_ids() if a != _book_action]
+    candidates = [a for a in await scrape_action_ids(acc, session_id, date) if a != _book_action]
     for aid in candidates:
         if await _post_book(acc, session_id, date, aid):
             log.warning("auto-repair: nouvel id de réservation %s (ancien %s)", aid[:12], _book_action[:12])
@@ -346,7 +352,7 @@ async def cancel(acc: Account, t: str, date: str) -> bool:
     if await try_cancel(_cancel_action):
         return True
     # Id d'annulation périmé (rebuild KONX) : on ré-apprend, avec vérification.
-    for aid in (a for a in await scrape_action_ids() if a != _cancel_action):
+    for aid in (a for a in await scrape_action_ids(acc, t, date) if a != _cancel_action):
         if await try_cancel(aid):
             log.warning("auto-repair: nouvel id d'annulation %s (ancien %s)", aid[:12], _cancel_action[:12])
             _cancel_action = aid
@@ -778,16 +784,20 @@ async def snipe(rule: AutoRule) -> None:
 
 async def verify_actions() -> None:
     """Alerte si les ids d'action ne sont plus dans le bundle KONX (rebuild)."""
+    acc = next(iter(ACCOUNTS.values()), None)
+    if not acc:
+        return
     try:
-        page = (await client().get(f"{KONX_BASE}/app/seance")).text
-        m = re.search(r"/_next/static/chunks/app/app/seance/[\w.-]+\.js", page)
-        if not m:
+        today = datetime.now(TZ).date().isoformat()
+        classes = await fetch_planning(acc, today)
+        if not classes:
+            log.info("verify_actions: pas de cours aujourd'hui pour sonder le bundle")
             return
-        js = (await client().get(f"{KONX_BASE}{m.group(0)}")).text
-        for name, aid in (("réserver", FALLBACK_BOOK_ACTION), ("annuler", FALLBACK_CANCEL_ACTION)):
-            if aid not in js:
-                log.error("⚠️ action « %s » (%s) absente du bundle KONX — id à mettre à jour (KONX_%s_ACTION)",
-                          name, aid[:12], "BOOK" if name == "réserver" else "CANCEL")
+        ids = await scrape_action_ids(acc, classes[0]["session_id"], today)
+        for name, aid, var in (("réserver", _book_action, "BOOK"), ("annuler", _cancel_action, "CANCEL")):
+            if ids and aid not in ids:
+                log.error("⚠️ action « %s » (%s) absente du bundle KONX — sera ré-apprise, ou fixe KONX_%s_ACTION",
+                          name, aid[:12], var)
             else:
                 log.info("action « %s » ok (%s)", name, aid[:12])
     except Exception as e:  # noqa: BLE001
