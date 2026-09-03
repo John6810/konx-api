@@ -707,7 +707,8 @@ async def booking_intents_loop() -> None:
                     asyncio.create_task(_run_intent(ev))
 
             # Demandes d'annulation (« se retirer » dans l'app) : on annule sur
-            # KONX puis on retire l'event pour qu'il disparaisse de l'app.
+            # KONX puis on marque la séance « zappée » — elle reste dans
+            # l'historique au lieu de disparaître.
             rc = await client().get(
                 f"{KAME_SUPABASE_URL}/rest/v1/events",
                 params={
@@ -724,12 +725,18 @@ async def booking_intents_loop() -> None:
         await asyncio.sleep(60)
 
 
-async def _kame_delete_event(event_id: str) -> None:
-    await client().request(
-        "DELETE",
+async def _kame_mark_skipped(event_id: str) -> None:
+    """Annulation faite : la séance reste dans l'agenda, marquée « zappée ».
+
+    On la supprimait, et le sport annulé disparaissait de l'historique — donc
+    des statistiques de la semaine aussi. La garder dit ce qui s'est passé :
+    c'était prévu, on n'y est pas allé.
+    """
+    await client().patch(
         f"{KAME_SUPABASE_URL}/rest/v1/events",
         params={"id": f"eq.{event_id}"},
         headers={**_kame_headers(), "prefer": "return=minimal"},
+        json={"sport_status": "skipped", "konx_booking_status": None},
     )
 
 
@@ -738,8 +745,8 @@ async def _process_cancel(ev: dict) -> None:
     t = ev.get("konx_session_id")
     date = ev.get("event_date")
     if not (acc and t and date):
-        # Rien à annuler côté KONX (compte/cours inconnu) : on retire quand même.
-        await _kame_delete_event(ev["id"])
+        # Rien à annuler côté KONX (compte/cours inconnu) : on marque quand même.
+        await _kame_mark_skipped(ev["id"])
         return
     try:
         ok = await cancel(acc, t, date)
@@ -747,7 +754,7 @@ async def _process_cancel(ev: dict) -> None:
     except Exception as e:  # noqa: BLE001
         log.error("_process_cancel %s: %s", ev["id"], e)
         return  # on réessaiera au prochain passage (event garde le statut 'cancel')
-    await _kame_delete_event(ev["id"])
+    await _kame_mark_skipped(ev["id"])
 
 
 async def _run_intent(ev: dict) -> None:
