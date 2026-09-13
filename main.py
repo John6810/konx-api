@@ -573,13 +573,16 @@ async def _kame_event(event_id: str) -> dict | None:
     return rows[0] if rows else None
 
 
-async def _set_booking_status(event_id: str, status: str) -> None:
-    await client().patch(
+async def _set_booking_status(event_id: str, status: str) -> bool:
+    response = await client().patch(
         f"{KAME_SUPABASE_URL}/rest/v1/events",
-        params={"id": f"eq.{event_id}"},
-        headers={**_kame_headers(), "prefer": "return=minimal"},
+        params={"id": f"eq.{event_id}", "konx_booking_status": "eq.pending"},
+        headers={**_kame_headers(), "prefer": "return=representation"},
         content=json.dumps({"konx_booking_status": status}),
     )
+
+    response.raise_for_status()
+    return bool(response.json())
 
 
 async def notify_booked(person: str | None, title: str, date: str, time_: str | None) -> None:
@@ -655,31 +658,40 @@ async def snipe_intent(ev: dict) -> None:
     if wait > 0:
         await asyncio.sleep(wait)
 
-    # L'utilisateur a pu se désinscrire entre-temps : on revérifie.
-    fresh = await _kame_event(event_id)
-    if not fresh or fresh.get("konx_booking_status") != "pending":
-        log.info("intent %s annulée avant l'ouverture, on n'y touche pas", event_id)
-        return
+    async with _intent_lock(event_id):
+        # L'utilisateur a pu se désinscrire entre-temps : on revérifie.
+        fresh = await _kame_event(event_id)
+        if not fresh or fresh.get("konx_booking_status") != "pending":
+            log.info("intent %s annulée avant l'ouverture, on n'y touche pas", event_id)
+            return
 
-    await ensure_token(acc)
-    deadline = datetime.now(TZ) + timedelta(seconds=20)
-    booked = False
-    while datetime.now(TZ) < deadline and not booked:
-        booked = await book(acc, session_id, date)
+        await ensure_token(acc)
+        deadline = datetime.now(TZ) + timedelta(seconds=20)
+        booked = False
+        while datetime.now(TZ) < deadline and not booked:
+            booked = await book(acc, session_id, date)
+            if not booked:
+                await asyncio.sleep(0.5)
+        # Échec avec l'id connu : peut-être un rebuild KONX → on ré-apprend l'id.
         if not booked:
-            await asyncio.sleep(0.5)
-    # Échec avec l'id connu : peut-être un rebuild KONX → on ré-apprend l'id.
-    if not booked:
-        booked = await auto_repair_book(acc, session_id, date)
+            booked = await auto_repair_book(acc, session_id, date)
 
-    await _set_booking_status(event_id, "booked" if booked else "failed")
-    log.info("intent %s -> %s", event_id, "✅ booked" if booked else "❌ failed")
-    title = ev.get("title") or "Séance"
-    if booked:
-        await notify_booked(ev.get("assignee"), title, date, ev.get("event_time"))
-    else:
-        await notify_failed(ev.get("assignee"), title, date, ev.get("event_time"))
+        applied = await _set_booking_status(event_id, "booked" if booked else "failed")
+        if not applied:
+            log.info("intent %s changed during booking; preserving cancellation", event_id)
+            return
+        log.info("intent %s -> %s", event_id, "✅ booked" if booked else "❌ failed")
+        title = ev.get("title") or "Séance"
+        if booked:
+            await notify_booked(ev.get("assignee"), title, date, ev.get("event_time"))
+        else:
+            await notify_failed(ev.get("assignee"), title, date, ev.get("event_time"))
 
+
+_intent_locks: dict[str, asyncio.Lock] = {}
+
+def _intent_lock(event_id: str) -> asyncio.Lock:
+    return _intent_locks.setdefault(event_id, asyncio.Lock())
 
 _scheduled_intents: set[str] = set()
 
@@ -732,29 +744,34 @@ async def _kame_mark_skipped(event_id: str) -> None:
     des statistiques de la semaine aussi. La garder dit ce qui s'est passé :
     c'était prévu, on n'y est pas allé.
     """
-    await client().patch(
+    response = await client().patch(
         f"{KAME_SUPABASE_URL}/rest/v1/events",
-        params={"id": f"eq.{event_id}"},
+        params={"id": f"eq.{event_id}", "konx_booking_status": "eq.cancel"},
         headers={**_kame_headers(), "prefer": "return=minimal"},
         json={"sport_status": "skipped", "konx_booking_status": None},
     )
 
+    response.raise_for_status()
+
 
 async def _process_cancel(ev: dict) -> None:
-    acc = account_for_person(ev.get("assignee"))
-    t = ev.get("konx_session_id")
-    date = ev.get("event_date")
-    if not (acc and t and date):
-        # Rien à annuler côté KONX (compte/cours inconnu) : on marque quand même.
-        await _kame_mark_skipped(ev["id"])
-        return
-    try:
-        ok = await cancel(acc, t, date)
-        log.info("annulation %s %s %s -> %s", acc.key, t[:8], date, "✅" if ok else "❌")
-    except Exception as e:  # noqa: BLE001
-        log.error("_process_cancel %s: %s", ev["id"], e)
-        return  # on réessaiera au prochain passage (event garde le statut 'cancel')
-    await _kame_mark_skipped(ev["id"])
+    # Serialize actual network actions with the booking attempt for this event.
+    # Sleeping until the opening does not hold this lock.
+    async with _intent_lock(ev["id"]):
+        acc = account_for_person(ev.get("assignee"))
+        t = ev.get("konx_session_id")
+        date = ev.get("event_date")
+        if not (acc and t and date):
+            log.warning("cancel %s: account/course missing; keeping request pending", ev["id"])
+            return
+        try:
+            ok = await cancel(acc, t, date)
+            if not ok:
+                log.warning("cancel %s refused; retrying next cycle", ev["id"])
+                return
+            await _kame_mark_skipped(ev["id"])
+        except Exception as e:
+            log.error("_process_cancel %s: %s", ev["id"], e)
 
 
 async def _run_intent(ev: dict) -> None:
