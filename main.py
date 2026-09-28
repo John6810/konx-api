@@ -887,6 +887,125 @@ async def verify_actions() -> None:
         log.warning("verify_actions: %s", e)
 
 
+# Read-only reconciliation: never calls KONX booking/cancellation actions.
+def registration_state(page: str, session_id: str, day: str) -> bool | None:
+    # Next.js embeds the authenticated user's occurrence, including past courses.
+    # Decode JSON instead of searching text which also contains other participants.
+    chunks = []
+    for match in re.finditer(r'self\.__next_f\.push\((\[.*?\])\)</script>', page):
+        try:
+            part = json.loads(match.group(1))
+            if part[0] == 1 and isinstance(part[1], str):
+                chunks.append(part[1])
+        except (ValueError, IndexError, TypeError):
+            continue
+    payload = ''.join(chunks)
+    states = []
+    for match in re.finditer(r'"occ"\s*:\s*', payload):
+        try:
+            occurrence, _ = json.JSONDecoder().raw_decode(payload[match.end():])
+        except ValueError:
+            continue
+        if not isinstance(occurrence, dict):
+            continue
+        state = occurrence.get('is_booked_by_me')
+        if (occurrence.get('template_id') == session_id and occurrence.get('date') == day
+                and type(state) is bool and occurrence.get('my_waitlist_position') is None):
+            states.append(state)
+    return states[0] if states and all(s == states[0] for s in states) else None
+
+
+def reservation_match(rows: list[dict], person: str, day: str, course: dict) -> dict | None:
+    own = [r for r in rows if r.get('assignee') == person and r.get('event_date') == day]
+    linked = [r for r in own if r.get('konx_session_id') == course['session_id']]
+    if len(linked) == 1:
+        return linked[0]
+    if linked:
+        return None
+    manual = [r for r in own if not r.get('konx_session_id')
+              and r.get('sport_activity') == course.get('activity')
+              and course.get('start_time') and course.get('end_time')
+              and (r.get('event_time') or '')[:5] == course['start_time'][:5]
+              and (r.get('end_time') or '')[:5] == course['end_time'][:5]]
+    return manual[0] if len(manual) == 1 else None
+
+
+async def reconcile_course(acc: Account, day: str, course: dict, state: bool | None, rows: list[dict]) -> None:
+    if state is None:
+        return
+    row = reservation_match(rows, acc.name, day, course)
+    if row and row.get('konx_booking_status') in ('pending', 'cancel'):
+        return  # A user's in-flight instruction always wins.
+    if state is False:
+        if not row or row.get('konx_booking_status') != 'booked' or not row.get('konx_session_id'):
+            return
+        patch = {'konx_booking_status': None}
+        if row.get('sport_status') != 'done':
+            patch['sport_status'] = 'skipped'
+    else:
+        patch = {'konx_session_id': course['session_id'], 'konx_booking_status': 'booked'}
+        if not row:
+            # Ambiguous manual records are left for the user, rather than duplicated.
+            if any(r.get('assignee') == acc.name and r.get('event_date') == day
+                   and (r.get('event_time') or '')[:5] == (course.get('start_time') or '')[:5] for r in rows):
+                return
+            import uuid
+            if not course.get('start_time') or not course.get('end_time'):
+                return
+            patch.update(id=str(uuid.uuid5(uuid.NAMESPACE_URL, f'{KAME_HOUSEHOLD_ID}/{acc.key}/{day}/{course["session_id"]}')),
+                         household_id=KAME_HOUSEHOLD_ID, assignee=acc.name, category='sport',
+                         sport_activity=course.get('activity', 'crossfit'), title=course.get('title') or 'CrossFit',
+                         event_date=day, event_time=course['start_time'], end_date=day, end_time=course['end_time'],
+                         emoji='🏋️', color='#F97316', created_by_name=acc.name)
+            r = await client().post(f'{KAME_SUPABASE_URL}/rest/v1/events',
+                headers={**_kame_headers(), 'prefer': 'resolution=ignore-duplicates,return=minimal'},
+                params={'on_conflict': 'id'}, json=patch)
+            r.raise_for_status()
+            rows.append(patch)
+            return
+    if all(row.get(k) == v for k, v in patch.items()):
+        return
+    params = {'id': f'eq.{row["id"]}', 'household_id': f'eq.{KAME_HOUSEHOLD_ID}',
+              'version': f'eq.{row["version"]}',
+              'konx_booking_status': f'eq.{row["konx_booking_status"]}' if row.get('konx_booking_status') else 'is.null'}
+    r = await client().patch(f'{KAME_SUPABASE_URL}/rest/v1/events', params=params,
+                             headers=_kame_headers(), json=patch)
+    r.raise_for_status()
+
+
+async def reservations_sync_loop() -> None:
+    while True:
+        if KAME_SUPABASE_URL and KAME_SERVICE_ROLE_KEY and KAME_HOUSEHOLD_ID:
+            for acc in ACCOUNTS.values():
+                try:
+                    today = datetime.now(TZ).date()
+                    r = await client().get(f'{KAME_SUPABASE_URL}/rest/v1/events', headers=_kame_headers(), params={
+                        'household_id': f'eq.{KAME_HOUSEHOLD_ID}', 'assignee': f'eq.{acc.name}',
+                        'category': 'eq.sport', 'and': f'(event_date.gte.{today},event_date.lte.{today + timedelta(days=6)})',
+                        'select': 'id,version,assignee,event_date,event_time,end_time,sport_activity,sport_status,konx_session_id,konx_booking_status'})
+                    r.raise_for_status()
+                    rows = r.json()
+                    for offset in range(7):
+                        day = (today + timedelta(days=offset)).isoformat()
+                        courses = await fetch_planning(acc, day)
+                        for course in courses:
+                            if course.get('locked'):
+                                continue
+                            page = await client().get(f'{KONX_BASE}/app/seance', params={
+                                't': course['session_id'], 'd': day, 'club': KONX_CLUB_ID},
+                                headers={'cookie': auth_cookie(acc)})
+                            if page.status_code == 200:
+                                existing = reservation_match(rows, acc.name, day, course)
+                                async with _intent_lock(existing['id'] if existing else course['session_id']):
+                                    await reconcile_course(acc, day, course, registration_state(page.text, course["session_id"], day), rows)
+                            await asyncio.sleep(0.25)
+                    log.info('reservation reconciliation completed: %s', acc.key)
+                except Exception as exc:
+                    # No response body or token in logs; next cycle safely retries.
+                    log.warning('reservation reconciliation failed: %s (%s)', acc.key, type(exc).__name__)
+        await asyncio.sleep(900)
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     global _client
@@ -896,6 +1015,7 @@ async def _startup() -> None:
         asyncio.create_task(snipe(rule))
     asyncio.create_task(classes_sync_loop())
     asyncio.create_task(booking_intents_loop())
+    asyncio.create_task(reservations_sync_loop())
     asyncio.create_task(verify_actions())
     log.info("konx-api démarré · comptes=%s · règles=%d", list(ACCOUNTS), len(rules))
 
