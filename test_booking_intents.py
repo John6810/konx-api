@@ -48,7 +48,7 @@ class ReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.ns={'Account':object,'re':__import__('re'),'json':__import__('json'),'client':lambda:self.client,
                  'KAME_SUPABASE_URL':'https://example.test','KAME_HOUSEHOLD_ID':'home','_kame_headers':lambda:{}}
         for node in tree.body:
-            if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef)) and node.name in ('registration_state','reservation_match','reconcile_course'):
+            if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef)) and node.name in ('registration_state','reservation_match','reconcile_course','reconciliation_courses'):
                 exec(compile(ast.Module(body=[node],type_ignores=[]),str(source),'exec'),self.ns)
         self.acc=SimpleNamespace(key='alice',name='Alice')
         self.course={'session_id':'class','start_time':'09:00','end_time':'10:00','activity':'crossfit','title':'Wod'}
@@ -89,6 +89,11 @@ class ReconciliationTests(unittest.IsolatedAsyncioTestCase):
         match=self.ns['reservation_match']
         self.assertIsNone(match([self.row],'Bob','2026-09-28',self.course))
         self.assertIsNone(match([self.row],'Alice','2026-09-29',self.course))
+    def test_hidden_past_bookings_are_still_checked(self):
+        courses=self.ns['reconciliation_courses']([], [self.row], '2026-09-28')
+        self.assertEqual([c['session_id'] for c in courses], ['class'])
+        self.assertEqual(self.ns['reconciliation_courses']([], [self.row], '2026-09-29'), [])
+        self.assertEqual(len(self.ns['reconciliation_courses']([self.course], [self.row], '2026-09-28')), 1)
     async def test_retry_inserts_same_id(self):
         for _ in range(2):
             await self.ns['reconcile_course'](self.acc,'2026-09-28',self.course,True,[])

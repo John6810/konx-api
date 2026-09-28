@@ -973,6 +973,20 @@ async def reconcile_course(acc: Account, day: str, course: dict, state: bool | N
     r.raise_for_status()
 
 
+def reconciliation_courses(planning: list[dict], rows: list[dict], day: str) -> list[dict]:
+    # KONX hides some past courses from the planning. Still verify reservations
+    # already known to Kame by their stable template identifier and date.
+    result = list(planning)
+    seen = {c['session_id'] for c in result}
+    for row in rows:
+        sid = row.get('konx_session_id')
+        if row.get('event_date') == day and sid and sid not in seen:
+            result.append({'session_id': sid, 'start_time': row.get('event_time'),
+                           'end_time': row.get('end_time'), 'activity': row.get('sport_activity')})
+            seen.add(sid)
+    return result
+
+
 async def reservations_sync_loop() -> None:
     while True:
         if KAME_SUPABASE_URL and KAME_SERVICE_ROLE_KEY and KAME_HOUSEHOLD_ID:
@@ -987,7 +1001,7 @@ async def reservations_sync_loop() -> None:
                     rows = r.json()
                     for offset in range(7):
                         day = (today + timedelta(days=offset)).isoformat()
-                        courses = await fetch_planning(acc, day)
+                        courses = reconciliation_courses(await fetch_planning(acc, day), rows, day)
                         for course in courses:
                             if course.get('locked'):
                                 continue
