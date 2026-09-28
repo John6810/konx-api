@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import re
+import random
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -888,7 +889,7 @@ async def verify_actions() -> None:
 
 
 # Read-only reconciliation: never calls KONX booking/cancellation actions.
-def registration_state(page: str, session_id: str, day: str) -> bool | None:
+def registration_details(page: str, session_id: str, day: str) -> dict | None:
     # Next.js embeds the authenticated user's occurrence, including past courses.
     # Decode JSON instead of searching text which also contains other participants.
     chunks = []
@@ -911,8 +912,50 @@ def registration_state(page: str, session_id: str, day: str) -> bool | None:
         state = occurrence.get('is_booked_by_me')
         if (occurrence.get('template_id') == session_id and occurrence.get('date') == day
                 and type(state) is bool and occurrence.get('my_waitlist_position') is None):
-            states.append(state)
+            states.append(occurrence)
     return states[0] if states and all(s == states[0] for s in states) else None
+
+
+def registration_state(page: str, session_id: str, day: str) -> bool | None:
+    details = registration_details(page, session_id, day)
+    return (False if details.get('status') == 'cancelled' else details['is_booked_by_me']) if details else None
+
+
+def course_from_details(course: dict, details: dict) -> dict:
+    result = {**course, 'cancelled': details.get('status') == 'cancelled',
+              'cancellation_reason': str(details.get('cancellation_reason') or '')[:300]}
+    for source, target in [('starts_at', 'start_time'), ('ends_at', 'end_time')]:
+        try:
+            stamp = datetime.fromisoformat(details[source].replace('Z', '+00:00'))
+            if stamp.tzinfo is None:
+                continue
+            local = stamp.astimezone(TZ)
+            if local.date().isoformat() == details['date']:
+                result[target] = local.strftime('%H:%M')
+        except (KeyError, ValueError, TypeError, AttributeError):
+            pass
+    title = details.get('course_name')
+    if isinstance(title, str) and title.strip():
+        result['title'] = title.strip()[:200]
+    return result
+
+
+def reconciliation_note(row: dict, message: str) -> str:
+    kept = [line for line in (row.get('notes') or '').splitlines() if not line.startswith('[KONX] ')]
+    return '\n'.join(kept + ['[KONX] ' + message]).strip()
+
+
+async def notify_reconciled(person: str, title: str, body: str) -> None:
+    # Native iPhone notifications are queued transactionally by events' trigger.
+    # This also reaches the person's web subscriptions, not the whole household.
+    try:
+        response = await client().post(f'{KAME_APP_URL}/api/push/konx',
+            headers={'authorization': f'Bearer {KAME_SERVICE_ROLE_KEY}', 'content-type': 'application/json'},
+            json={'householdId': KAME_HOUSEHOLD_ID, 'toName': person, 'title': title,
+                  'body': body[:500], 'url': '/sport'})
+        response.raise_for_status()
+    except Exception as exc:
+        log.warning('reservation web notification failed (%s)', type(exc).__name__)
 
 
 def reservation_match(rows: list[dict], person: str, day: str, course: dict) -> dict | None:
@@ -936,14 +979,31 @@ async def reconcile_course(acc: Account, day: str, course: dict, state: bool | N
     row = reservation_match(rows, acc.name, day, course)
     if row and row.get('konx_booking_status') in ('pending', 'cancel'):
         return  # A user's in-flight instruction always wins.
+    notification_title = 'Réservation KONX mise à jour'
     if state is False:
-        if not row or row.get('konx_booking_status') != 'booked' or not row.get('konx_session_id'):
+        if not row or not row.get('konx_session_id'):
             return
-        patch = {'konx_booking_status': None}
+        if row.get('konx_booking_status') != 'booked' and not course.get('cancelled'):
+            return
+        message = ('Cours annulé par KONX.' + (' ' + course['cancellation_reason'] if course.get('cancellation_reason') else '')) if course.get('cancelled') else 'Inscription retirée sur KONX.'
+        notification_title = 'Cours annulé' if course.get('cancelled') else 'Inscription retirée'
+        patch = {'konx_booking_status': None, 'notes': reconciliation_note(row, message)}
         if row.get('sport_status') != 'done':
             patch['sport_status'] = 'skipped'
     else:
         patch = {'konx_session_id': course['session_id'], 'konx_booking_status': 'booked'}
+        if row and row.get('konx_session_id') and row.get('konx_booking_status') != 'booked':
+            patch['notes'] = reconciliation_note(row, 'Inscription confirmée sur KONX.')
+        if row and row.get('sport_status') != 'done':
+            # Preserve completed workouts. Only update the schedule of future courses.
+            start = course.get('start_time')
+            if start and datetime.fromisoformat(day + 'T' + start).replace(tzinfo=TZ) > datetime.now(TZ):
+                for field, value in [('event_time', start), ('end_time', course.get('end_time')), ('title', course.get('title'))]:
+                    if value and (str(row.get(field) or '')[:5] != value[:5] if field.endswith('time') else row.get(field) != value):
+                        patch[field] = value
+                if any(k in patch for k in ('event_time', 'end_time', 'title')):
+                    notification_title = 'Cours KONX modifié'
+                    patch['notes'] = reconciliation_note(row, 'Cours modifié : ' + (course.get('title') or row.get('title') or 'Cours') + ' à ' + start[:5] + '.')
         if not row:
             # Ambiguous manual records are left for the user, rather than duplicated.
             if any(r.get('assignee') == acc.name and r.get('event_date') == day
@@ -958,10 +1018,13 @@ async def reconcile_course(acc: Account, day: str, course: dict, state: bool | N
                          event_date=day, event_time=course['start_time'], end_date=day, end_time=course['end_time'],
                          emoji='🏋️', color='#F97316', created_by_name=acc.name)
             r = await client().post(f'{KAME_SUPABASE_URL}/rest/v1/events',
-                headers={**_kame_headers(), 'prefer': 'resolution=ignore-duplicates,return=minimal'},
+                headers={**_kame_headers(), 'prefer': 'resolution=ignore-duplicates,return=representation'},
                 params={'on_conflict': 'id'}, json=patch)
             r.raise_for_status()
-            rows.append(patch)
+            inserted = r.json()
+            if inserted:
+                rows.extend(inserted)
+                await notify_reconciled(acc.name, 'Réservation trouvée sur KONX', f"{patch['title']} · {day} à {course['start_time'][:5]}")
             return
     if all(row.get(k) == v for k, v in patch.items()):
         return
@@ -969,8 +1032,13 @@ async def reconcile_course(acc: Account, day: str, course: dict, state: bool | N
               'version': f'eq.{row["version"]}',
               'konx_booking_status': f'eq.{row["konx_booking_status"]}' if row.get('konx_booking_status') else 'is.null'}
     r = await client().patch(f'{KAME_SUPABASE_URL}/rest/v1/events', params=params,
-                             headers=_kame_headers(), json=patch)
+                             headers={**_kame_headers(), 'prefer': 'return=representation'}, json=patch)
     r.raise_for_status()
+    changed = r.json()
+    if changed:
+        row.update(changed[0])
+        await notify_reconciled(acc.name, notification_title,
+            f"{row.get('title') or 'Cours'} · {day} à {(row.get('event_time') or '')[:5]}. " + patch.get('notes', '').split('[KONX] ')[-1])
 
 
 def reconciliation_courses(planning: list[dict], rows: list[dict], day: str) -> list[dict]:
@@ -987,23 +1055,47 @@ def reconciliation_courses(planning: list[dict], rows: list[dict], day: str) -> 
     return result
 
 
+def scan_window_open(now: datetime) -> bool:
+    local = now.astimezone(TZ)
+    return 7 <= local.hour < 20
+
+
+def next_scan_at(now: datetime, minutes: float) -> datetime:
+    local = now.astimezone(TZ)
+    opening = local.replace(hour=7, minute=0, second=0, microsecond=0)
+    if local < opening:
+        return opening
+    candidate = local + timedelta(minutes=max(45, min(60, minutes)))
+    if local.hour >= 20 or candidate.hour >= 20 or candidate.date() != local.date():
+        return (opening + timedelta(days=1))
+    return candidate
+
+
 async def reservations_sync_loop() -> None:
     while True:
+        if not scan_window_open(datetime.now(TZ)):
+            now = datetime.now(TZ)
+            await asyncio.sleep(max(1, next_scan_at(now, 45).timestamp() - now.timestamp()))
+            continue
         if KAME_SUPABASE_URL and KAME_SERVICE_ROLE_KEY and KAME_HOUSEHOLD_ID:
             for acc in ACCOUNTS.values():
+                if not scan_window_open(datetime.now(TZ)): break
                 try:
                     today = datetime.now(TZ).date()
                     r = await client().get(f'{KAME_SUPABASE_URL}/rest/v1/events', headers=_kame_headers(), params={
                         'household_id': f'eq.{KAME_HOUSEHOLD_ID}', 'assignee': f'eq.{acc.name}',
                         'category': 'eq.sport', 'and': f'(event_date.gte.{today},event_date.lte.{today + timedelta(days=6)})',
-                        'select': 'id,version,assignee,event_date,event_time,end_time,sport_activity,sport_status,konx_session_id,konx_booking_status'})
+                        'select': 'id,version,title,notes,assignee,event_date,event_time,end_time,sport_activity,sport_status,konx_session_id,konx_booking_status'})
                     r.raise_for_status()
                     rows = r.json()
                     for offset in range(7):
+                        if not scan_window_open(datetime.now(TZ)): break
                         day = (today + timedelta(days=offset)).isoformat()
                         courses = reconciliation_courses(await fetch_planning(acc, day), rows, day)
                         for course in courses:
-                            if course.get('locked'):
+                            if not scan_window_open(datetime.now(TZ)): break
+                            existing = reservation_match(rows, acc.name, day, course)
+                            if course.get('locked') and not existing:
                                 continue
                             page = await client().get(f'{KONX_BASE}/app/seance', params={
                                 't': course['session_id'], 'd': day, 'club': KONX_CLUB_ID},
@@ -1011,13 +1103,19 @@ async def reservations_sync_loop() -> None:
                             if page.status_code == 200:
                                 existing = reservation_match(rows, acc.name, day, course)
                                 async with _intent_lock(existing['id'] if existing else course['session_id']):
-                                    await reconcile_course(acc, day, course, registration_state(page.text, course["session_id"], day), rows)
+                                    details = registration_details(page.text, course["session_id"], day)
+                                    if details:
+                                        await reconcile_course(acc, day, course_from_details(course, details),
+                                            False if details.get('status') == 'cancelled' else details['is_booked_by_me'], rows)
                             await asyncio.sleep(0.25)
                     log.info('reservation reconciliation completed: %s', acc.key)
                 except Exception as exc:
                     # No response body or token in logs; next cycle safely retries.
                     log.warning('reservation reconciliation failed: %s (%s)', acc.key, type(exc).__name__)
-        await asyncio.sleep(900)
+        now = datetime.now(TZ)
+        target = next_scan_at(now, random.uniform(45, 60))
+        log.info('next reservation scan: %s', target.isoformat())
+        await asyncio.sleep(max(1, target.timestamp() - now.timestamp()))
 
 
 @app.on_event("startup")
